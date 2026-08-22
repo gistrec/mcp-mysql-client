@@ -1,0 +1,94 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.gistrec/mcp-mysql-client",
+  "title": "MySQL MCP",
+  "description": "MCP server for one MySQL database: schema, read-only queries and guarded writes.",
+  "websiteUrl": "https://github.com/gistrec/mcp-mysql-client#readme",
+  "repository": {
+    "url": "https://github.com/gistrec/mcp-mysql-client",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "mcp-mysql-client",
+      "version": "1.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "MYSQL_HOST",
+          "description": "Database host.",
+          "isRequired": false,
+          "default": "127.0.0.1"
+        },
+        {
+          "name": "MYSQL_PORT",
+          "description": "Database port.",
+          "isRequired": false,
+          "default": "3306"
+        },
+        {
+          "name": "MYSQL_USER",
+          "description": "MySQL user. Use one with the least privileges the task needs, never root.",
+          "isRequired": true
+        },
+        {
+          "name": "MYSQL_PASS",
+          "description": "Password for that user. Treat it as a secret; MYSQL_PASS_FILE reads it from a file instead.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "MYSQL_DB",
+          "description": "The one database this server is bound to. No tool can leave it.",
+          "isRequired": true
+        },
+        {
+          "name": "MYSQL_SSL",
+          "description": "Require a TLS connection to the server.",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
+          "name": "MYSQL_SSL_CA",
+          "description": "Path to the CA bundle verifying the server certificate; implies MYSQL_SSL.",
+          "isRequired": false
+        },
+        {
+          "name": "ALLOW_INSERT_OPERATION",
+          "description": "Allow INSERT statements through the execute tool.",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
+          "name": "ALLOW_UPDATE_OPERATION",
+          "description": "Allow UPDATE statements through the execute tool.",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
+          "name": "ALLOW_DELETE_OPERATION",
+          "description": "Allow DELETE statements through the execute tool.",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
+          "name": "MYSQL_MAX_ROWS",
+          "description": "Row cap for one read; the result is marked truncated when it is hit.",
+          "isRequired": false,
+          "default": "1000"
+        },
+        {
+          "name": "MYSQL_TIMEOUT_MS",
+          "description": "Statement timeout in milliseconds; the connection is dropped on expiry.",
+          "isRequired": false,
+          "default": "30000"
+        }
+      ]
+    }
+  ]
+}

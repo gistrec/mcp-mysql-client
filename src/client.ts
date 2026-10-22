@@ -124,7 +124,10 @@ export class MysqlClient {
       // wait_timeout and a NAT on the way may swallow the FIN, so the next
       // statement is written into a dead socket. Idle connections are closed
       // after a minute instead; reconnecting costs a handshake, not a hang.
-      maxIdle: 0,
+      // mysql2 runs its idle sweeper only while maxIdle < connectionLimit, and
+      // evicts by count beyond maxIdle within a second — so maxIdle sits one
+      // below the limit, and age alone decides for the rest.
+      maxIdle: Math.max(0, config.poolSize - 1),
       idleTimeout: 60_000,
       enableKeepAlive: true,
       keepAliveInitialDelay: 30_000,

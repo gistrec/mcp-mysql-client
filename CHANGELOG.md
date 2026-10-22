@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] — 2026-10-22
+
+### Fixed
+
+- A statement no longer hangs past `MYSQL_TIMEOUT_MS`. mysql2 never fails the command in flight
+  on a destroyed connection, so the deadline now drops the socket outright and settles the call
+  with a timeout.
+- Idle pooled connections are closed after a minute instead of being kept indefinitely. A socket
+  the server dropped after `wait_timeout` — with the FIN lost on a NAT along the way — no longer
+  turns the next call into an `ETIMEDOUT`. TCP keepalive starts after 30 seconds.
+
+### Added
+
+- End-to-end tests against real MySQL 8.4 and MariaDB 11.4 in CI (`npm run test:e2e`), including
+  a dead link simulated by a relay that silently stops forwarding.
+
 ## [1.0.0] — 2026-08-21
 
 ### Added
@@ -32,4 +48,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - MySQL error map turning 1045 / 1044 / 1142 / 3159 / `ECONNREFUSED` and friends into the actual fix.
 - Anonymous usage telemetry (opt-out `ASKADS_TELEMETRY=0`) that never sees SQL, data or names.
 
+[1.0.1]: https://github.com/gistrec/mcp-mysql-client/releases/tag/v1.0.1
 [1.0.0]: https://github.com/gistrec/mcp-mysql-client/releases/tag/v1.0.0

@@ -79,6 +79,7 @@ interface RawQuery {
 }
 interface RawConnection {
   query(options: { sql: string; values?: unknown[] }): RawQuery;
+  stream?: { destroy(): void };
 }
 
 export interface ReadOptions {
@@ -119,7 +120,14 @@ export class MysqlClient {
       waitForConnections: true,
       connectionLimit: config.poolSize,
       queueLimit: 0,
+      // An idle pooled socket is a liability: the server drops it after
+      // wait_timeout and a NAT on the way may swallow the FIN, so the next
+      // statement is written into a dead socket. Idle connections are closed
+      // after a minute instead; reconnecting costs a handshake, not a hang.
+      maxIdle: 0,
+      idleTimeout: 60_000,
       enableKeepAlive: true,
+      keepAliveInitialDelay: 30_000,
       // A second line of defence behind sql.ts: even a payload that slipped
       // past the classifier cannot smuggle a second statement.
       multipleStatements: false,
@@ -165,20 +173,25 @@ export class MysqlClient {
       let dirty = false;
       const guard = this.arm(conn);
       try {
-        if (this.config.readOnlyTransactions) await conn.query("START TRANSACTION READ ONLY");
-        dirty = true;
-        const { rows, truncated, columns } = await this.streamRows(conn, sql, params, maxRows);
-        // A cut-short stream leaves rows unread on the wire; the connection is
-        // no longer reusable, so it is dropped instead of committed.
-        if (!truncated && this.config.readOnlyTransactions) await conn.query("COMMIT");
-        dirty = truncated;
-        return {
-          rows,
-          rowCount: rows.length,
-          truncated,
-          columns,
-          durationMs: Date.now() - started,
-        };
+        return await Promise.race([
+          guard.expired,
+          (async () => {
+            if (this.config.readOnlyTransactions) await conn.query("START TRANSACTION READ ONLY");
+            dirty = true;
+            const { rows, truncated, columns } = await this.streamRows(conn, sql, params, maxRows);
+            // A cut-short stream leaves rows unread on the wire; the connection is
+            // no longer reusable, so it is dropped instead of committed.
+            if (!truncated && this.config.readOnlyTransactions) await conn.query("COMMIT");
+            dirty = truncated;
+            return {
+              rows,
+              rowCount: rows.length,
+              truncated,
+              columns,
+              durationMs: Date.now() - started,
+            };
+          })(),
+        ]);
       } catch (err) {
         dirty = true;
         throw this.wrap(err, guard);
@@ -203,7 +216,7 @@ export class MysqlClient {
       const guard = this.arm(conn);
       let broken = false;
       try {
-        const [result] = await conn.query(sql, params);
+        const [result] = await Promise.race([guard.expired, conn.query(sql, params)]);
         const header = result as {
           affectedRows?: number;
           changedRows?: number;
@@ -276,18 +289,32 @@ export class MysqlClient {
   }
 
   /**
-   * Client-side statement timeout. A promise race would leave the query running
-   * on the server and the connection unusable, so the deadline destroys the
-   * connection: MySQL notices the socket closing and kills the statement with
-   * it. `fired` tells the catch block that the error it is about to see is a
-   * timeout, not a network fault.
+   * Client-side statement timeout. The deadline tears the socket down: MySQL
+   * notices it closing and kills the statement with it. That alone does not
+   * settle the call — mysql2 marks a destroyed connection as closing and then
+   * never fails the command in flight — so `expired` rejects too, and the
+   * caller races its work against it. `fired` tells the catch block that the
+   * error it is about to see is a timeout, not a network fault.
    */
-  private arm(conn: PoolConnection): { fired: boolean; disarm: () => void } {
-    const guard = { fired: false, disarm: () => clearTimeout(timer) };
-    const timer = setTimeout(() => {
-      guard.fired = true;
-      conn.destroy();
-    }, this.config.timeoutMs);
+  private arm(conn: PoolConnection): { fired: boolean; expired: Promise<never>; disarm: () => void } {
+    let timer: NodeJS.Timeout | undefined;
+    const guard = {
+      fired: false,
+      expired: new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          guard.fired = true;
+          conn.destroy();
+          // destroy() is a graceful end(); on a dead link the FIN is never
+          // acknowledged, so the socket is dropped outright.
+          (conn as unknown as { connection: RawConnection }).connection.stream?.destroy();
+          reject(new TimeoutError(this.config.timeoutMs));
+        }, this.config.timeoutMs);
+      }),
+      disarm: () => clearTimeout(timer),
+    };
+    // A guard disarmed before its deadline never rejects; one that fires is
+    // awaited through the race, so this only silences the unobserved copy.
+    guard.expired.catch(() => {});
     return guard;
   }
 

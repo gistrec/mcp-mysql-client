@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { MysqlClient, normalizeRow } from "./client.js";
 import { loadConfig } from "./config.js";
-import { CredentialsError } from "./types.js";
+import { CredentialsError, TimeoutError } from "./types.js";
 
 test("without credentials every path fails with the fix, not a connection attempt", async () => {
   const client = new MysqlClient(loadConfig({}));
@@ -63,4 +63,26 @@ test("rows without binary columns are passed through untouched", () => {
   assert.equal(normalizeRow(row), row);
   assert.equal(normalizeRow(null), null);
   assert.equal(normalizeRow(42), 42);
+});
+
+test("a statement that never answers settles with a timeout instead of hanging", async () => {
+  const config = { ...loadConfig({ MYSQL_USER: "u", MYSQL_DB: "d", MYSQL_TIMEOUT_MS: "50" }), maxRetries: 0 };
+  const client = new MysqlClient(config);
+  let socketDropped = false;
+  // What mysql2 does on a dead link: destroy() marks the connection closing,
+  // and the command in flight never hears back.
+  const never = new Promise<never>(() => {});
+  const conn = {
+    query: () => never,
+    destroy: () => {},
+    release: () => {},
+    connection: { query: () => ({ on: () => {}, stream: () => never }), stream: { destroy: () => (socketDropped = true) } },
+  };
+  (client as unknown as { pool: unknown }).pool = { getConnection: async () => conn };
+
+  for (const call of [() => client.read("SELECT 1"), () => client.write("INSERT INTO t (a) VALUES (1)")]) {
+    socketDropped = false;
+    await assert.rejects(call, (err: unknown) => err instanceof TimeoutError);
+    assert.ok(socketDropped, "the socket itself must be dropped, not just ended");
+  }
 });

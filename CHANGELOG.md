@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-10-31
+
+### Changed
+
+- Telemetry: the `tool_call` event is sent when the call finishes and carries its outcome: `ok` or an
+  error category (`error_auth`, `error_invalid_request`, …). MySQL error text is never sent. Opt-out is unchanged:
+  `ASKADS_TELEMETRY=0`.
+
 ## [1.0.1] — 2026-10-22
 
 ### Fixed
@@ -48,5 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - MySQL error map turning 1045 / 1044 / 1142 / 3159 / `ECONNREFUSED` and friends into the actual fix.
 - Anonymous usage telemetry (opt-out `ASKADS_TELEMETRY=0`) that never sees SQL, data or names.
 
+[1.1.0]: https://github.com/gistrec/mcp-mysql-client/releases/tag/v1.1.0
 [1.0.1]: https://github.com/gistrec/mcp-mysql-client/releases/tag/v1.0.1
 [1.0.0]: https://github.com/gistrec/mcp-mysql-client/releases/tag/v1.0.0

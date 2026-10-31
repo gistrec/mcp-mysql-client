@@ -1,6 +1,6 @@
 {
   "name": "mcp-mysql-client",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "MCP server for a MySQL database — schema inspection, read-only queries and guarded writes of one database for AI agents.",
   "mcpName": "io.github.gistrec/mcp-mysql-client",
   "type": "module",

@@ -1,5 +1,6 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { noteFailure } from "../telemetry.js";
 import { MysqlError, PermissionError } from "../types.js";
 
 /**
@@ -55,6 +56,11 @@ export function ok(data: unknown): CallToolResult {
  * password, the grant on the database, the grant on the table.
  */
 export function fail(err: unknown): CallToolResult {
+  // The tag is off the wire: telemetry reads the error's codes from it, never the message.
+  return noteFailure(failText(err), err);
+}
+
+function failText(err: unknown): CallToolResult {
   let message = err instanceof Error ? err.message : String(err);
   // Surface the underlying cause (e.g. the socket error behind a pool failure)
   // — no secrets live in cause, and it makes failures far easier to diagnose.

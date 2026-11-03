@@ -6,7 +6,9 @@
  * environment versions ever leave the machine. This server sees a database, so
  * the line is drawn hard: no SQL, no table or column names, no row data, no
  * host, user or database name, no tool arguments, and never the names or values
- * of environment variables. Sends are capped at 2 s and swallow every error —
+ * of environment variables. A failed tool_call's error_detail carries only
+ * MySQL error codes (errno/sqlState/symbolic code) and the names of the
+ * server's own error classes — never the message. Sends are capped at 2 s and swallow every error —
  * telemetry must never affect the server's operation. Opt out for every Ask Ads
  * MCP server at once: ASKADS_TELEMETRY=0 (also accepts false/off/no).
  */
@@ -69,6 +71,8 @@ export type TelemetryEvent = "server_start" | "tool_call" | "startup_failed" | "
 export interface EventFields {
   tool?: string;
   reason?: string;
+  /** tool_call only: error codes or our own error class name, never the message (see describeOwnError). */
+  error_detail?: string;
 }
 
 export class Telemetry {
@@ -117,6 +121,7 @@ export class Telemetry {
       client_version: this.clientInfo?.version,
       tool: fields.tool,
       reason: wireReason(event, fields.reason),
+      error_detail: event === "tool_call" ? fields.error_detail?.slice(0, DETAIL_MAX) : undefined,
       node_version: process.version,
       os: process.platform,
     });
@@ -217,11 +222,173 @@ export function toolOutcome(result: unknown, ...thrown: [unknown?]): ToolOutcome
   return didThrow ? "error_internal" : "error_other";
 }
 
+export const DETAIL_MAX = 200;
+
+// Masking for our own texts (ported from the fleet). Unlike the rest of the fleet there is no
+// allowlist pick over the error text here: a MySQL message quotes values (ER_DUP_ENTRY) and SQL
+// (ER_PARSE_ERROR), so MySQL failures are described by their codes only (describeOwnError).
+const SCRUB =
+  /(?<key>(?:login|password|secret|token|api[_-]?key|authorization)\s*[:=]\s*["']?|(?:bearer|basic)\s+)(?<val>[^,;]+)|[^\s,;]*(?:@|:\/\/|%3A|\p{L}\.\p{L})[^\s,;]*|(?<key2>\b(?:token|secret|password|api[_-]?key|access_token|refresh_token|client_secret)\s+)(?!(?:expired|invalid|is|was|for|has|not|missing|required|revoked|provided|type)\b)\S+|\b(?:y0_|AQAA|AQVN|t1\.|sk-|vk1\.|vk_|ghp_|ya29\.)\S+|\b(?=[\w-]*\d)(?=[\w-]*[A-Za-z])[\w-]{20,}\b|\+?\d(?:[\s().-]*\d){3,}/giu;
+const QUOTED = /(?<!\p{L})'[^'\n]+(?:'(?!\p{L})|$)|"[^"\n]+(?:"|$)|«[^»]+(?:»|$)/gu;
+
+function scrub(value: string, quoted = true): string {
+  return (quoted ? value.replace(QUOTED, "#") : value)
+    .replace(SCRUB, (...args) => {
+      const groups = args[args.length - 1] as { key?: string; key2?: string };
+      return (groups.key ?? groups.key2 ?? "") + "#";
+    })
+    .replace(/^[ ;:,.]+|[ ;:,.]+$/g, "");
+}
+
+/** A JS error quotes identifiers of our code, not user data, so its quotes are kept. */
+function maskedOwnText(prefix: string, text: string, quoted = true): string {
+  return (prefix + scrub(text.slice(0, 2 * DETAIL_MAX).split(/\s+/).filter(Boolean).join(" "), quoted)).slice(0, DETAIL_MAX);
+}
+
+type Described = { reason?: ToolOutcome; text: string };
+
+/** Set by fail(), never serialized: our own refusal ("local"), a bug in our code ("internal"), one of our error classes ("own") or another named error ("error"). */
+const FAILURE_ORIGIN = new WeakMap<
+  object,
+  { origin: "local" | "internal" | "error"; text: string } | ({ origin: "own" } & Described)
+>();
+const JS_ERRORS = new Set(["TypeError", "ReferenceError", "RangeError", "SyntaxError", "EvalError", "URIError"]);
+
+function jsBug(err: unknown): string | undefined {
+  if (!(err instanceof Error) || !JS_ERRORS.has(err.name)) return undefined;
+  // Node's own errors (ERR_INVALID_ARG_TYPE …, system errors) quote the values passed in: their code only.
+  const code: unknown = (err as { code?: unknown }).code;
+  if (code !== undefined || "errno" in err || "syscall" in err) {
+    return typeof code === "string" && /^[A-Z][A-Z0-9_]{2,40}$/.test(code) ? `${err.name} ${code}` : err.name;
+  }
+  return `${err.name}: ${err.message.split("\n")[0]}`;
+}
+
+/**
+ * Only the class name of an error, never the message: a plain Error or a system error (ENOENT …)
+ * can carry user data, so those send nothing.
+ */
+function errorText(err: unknown): string | undefined {
+  if (!(err instanceof Error) || "errno" in err || "syscall" in err) return undefined;
+  return /^[A-Z][A-Za-z0-9]*(?:Error|Exception)$/.test(err.name) && err.name !== "Error" ? err.name : undefined;
+}
+
+// MySQL server errnos and driver codes → outcome. An errno wins over the code; neither matched
+// falls back to the text classification (done locally, only the constant leaves).
+const MYSQL_OUTCOMES = new Map<number | string, ToolOutcome>([
+  ...[1045, 1698, "ER_NOT_SUPPORTED_AUTH_MODE"].map((c) => [c, "error_auth"] as const),
+  ...[1044, 1142, 1143, 1227, 1792].map((c) => [c, "error_permission"] as const),
+  ...[1049, 1146, 1054, 1305].map((c) => [c, "error_not_found"] as const),
+  ...[1064, 1052, 1062, 1048, 1136, 1241, 1366, 1406, 1451, 1452].map((c) => [c, "error_invalid_request"] as const),
+  ...[1040, 1226].map((c) => [c, "error_rate_limit"] as const),
+  ...[1205, 1317, 3024, "ETIMEDOUT"].map((c) => [c, "error_timeout"] as const),
+  [1213, "error_upstream"],
+  ...[
+    "ECONNREFUSED",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "ECONNRESET",
+    "EPIPE",
+    "PROTOCOL_CONNECTION_LOST",
+    "HANDSHAKE_NO_SSL_SUPPORT",
+    3159,
+    "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "SELF_SIGNED_CERT_IN_CHAIN",
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  ].map((c) => [c, "error_network"] as const),
+]);
+
+/** The closed StatementKind vocabulary of sql.ts; anything else is not sent. */
+const PERMISSION_KINDS = new Set(["read", "insert", "update", "delete", "replace", "ddl", "forbidden"]);
+
+/**
+ * This server's own error classes (types.ts), recognized by name so telemetry does not import
+ * them. Every field that leaves passes a strict pattern; a MySQL message never does — it quotes
+ * row values and SQL. Returns undefined for anything else.
+ */
+export function describeOwnError(err: unknown): Described | undefined {
+  if (!(err instanceof Error)) return undefined;
+  const e = err as Error & { code?: unknown; errno?: unknown; sqlState?: unknown; kind?: unknown };
+  switch (err.name) {
+    case "MysqlError": {
+      const code = typeof e.code === "string" && /^[A-Z][A-Z0-9_]{2,40}$/.test(e.code) ? e.code : undefined;
+      const errno = typeof e.errno === "number" && Number.isInteger(e.errno) ? e.errno : undefined;
+      const sqlState = typeof e.sqlState === "string" && /^[0-9A-Z]{5}$/.test(e.sqlState) ? e.sqlState : undefined;
+      const parts = ["mysql"];
+      if (code) parts.push(code);
+      if (errno !== undefined) parts.push(`errno=${errno}`);
+      if (sqlState) parts.push(`sqlState=${sqlState}`);
+      const reason =
+        (errno !== undefined ? MYSQL_OUTCOMES.get(errno) : undefined) ?? (code ? MYSQL_OUTCOMES.get(code) : undefined);
+      return { reason, text: parts.join(" ") };
+    }
+    case "PermissionError": {
+      const kind = typeof e.kind === "string" && PERMISSION_KINDS.has(e.kind) ? ` kind=${e.kind}` : "";
+      return { reason: "error_permission", text: `local: PermissionError${kind}` };
+    }
+    case "ValidationError":
+      // The templates quote the caller's table name in «…»; drop everything between the first «
+      // and the last » so a name holding » itself is masked whole.
+      return { reason: "error_invalid_request", text: maskedOwnText("local: ", err.message.replace(/«[\s\S]*»/g, "#")) };
+    case "TimeoutError":
+      return { reason: "error_timeout", text: "TimeoutError" };
+    case "CredentialsError":
+      // The message names the missing env variables: the class name only.
+      return { reason: "error_auth", text: "CredentialsError" };
+    default:
+      return undefined;
+  }
+}
+
+/** Tags a failed result off the wire (WeakMap) with what telemetry may say about its error. */
+export function noteFailure<T>(result: T, err: unknown): T {
+  try {
+    if (result && typeof result === "object") {
+      if (typeof err === "string") FAILURE_ORIGIN.set(result, { origin: "local", text: err });
+      else {
+        const own = describeOwnError(err);
+        if (own) FAILURE_ORIGIN.set(result, { origin: "own", ...own });
+        else {
+          const bug = jsBug(err);
+          const text = bug ?? errorText(err);
+          if (text) FAILURE_ORIGIN.set(result, { origin: bug ? "internal" : "error", text });
+        }
+      }
+    }
+  } catch {
+    // never affects the result
+  }
+  return result;
+}
+
 /** Best effort: classifying or sending must never change what the tool returns or throws. */
-function reportCall(telemetry: Telemetry, tool: string, outcome: () => ToolOutcome): void {
+function reportCall(telemetry: Telemetry, tool: string, value: unknown, thrown: boolean): void {
   if (!telemetry.isEnabled()) return;
   try {
-    telemetry.send("tool_call", { tool, reason: outcome() });
+    let reason = thrown ? toolOutcome(undefined, value) : toolOutcome(value);
+    let detail = "";
+    if (reason !== "ok") {
+      const noted = value && typeof value === "object" ? FAILURE_ORIGIN.get(value) : undefined;
+      const own = noted?.origin === "own" ? noted : thrown ? describeOwnError(value) : undefined;
+      const bug = noted?.origin === "internal" ? noted.text : thrown ? jsBug(value) : undefined;
+      if (own) {
+        if (own.reason) reason = own.reason;
+        detail = own.text;
+      } else if (bug) {
+        reason = "error_internal";
+        detail = maskedOwnText("internal: ", bug, false);
+      } else if (noted?.origin === "local") {
+        reason = "error_invalid_request";
+        detail = maskedOwnText("local: ", noted.text);
+      } else {
+        const name = noted?.origin === "error" ? noted.text : thrown ? errorText(value) : undefined;
+        if (name) {
+          detail = name;
+          if (reason === "error_other") reason = toolOutcome({ isError: true, content: [{ type: "text", text: name }] });
+        }
+      }
+    }
+    telemetry.send("tool_call", { tool, reason, error_detail: detail || undefined });
   } catch {
     // a result shaped in a way the classifier did not expect — skip the ping, keep the call
   }
@@ -247,10 +414,10 @@ export function instrumentToolCalls(server: McpServer, telemetry: Telemetry): vo
         try {
           result = await (callback as (...a: unknown[]) => unknown)(...args);
         } catch (e) {
-          reportCall(telemetry, name, () => toolOutcome(undefined, e));
+          reportCall(telemetry, name, e, true);
           throw e;
         }
-        reportCall(telemetry, name, () => toolOutcome(result));
+        reportCall(telemetry, name, result, false);
         return result;
       }) as never,
     )) as typeof server.registerTool;

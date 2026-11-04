@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Telemetry: a failed `tool_call` now carries `error_detail` — only the MySQL error code (`errno`, `sqlState`,
+  symbolic `ER_*`/driver code) or the name of the server's own error class (`PermissionError kind=…`,
+  `TimeoutError`, …). The error message, SQL, table and column names and row values are still never sent.
+  Outcomes are classified by error code first (1054/1146 → `error_not_found`, 1064 → `error_invalid_request`,
+  a statement timeout → `error_timeout`), not only by text.
+
 ## [1.1.0] — 2026-10-31
 
 ### Changed
@@ -56,6 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - MySQL error map turning 1045 / 1044 / 1142 / 3159 / `ECONNREFUSED` and friends into the actual fix.
 - Anonymous usage telemetry (opt-out `ASKADS_TELEMETRY=0`) that never sees SQL, data or names.
 
+[Unreleased]: https://github.com/gistrec/mcp-mysql-client/compare/v1.1.0...HEAD
 [1.1.0]: https://github.com/gistrec/mcp-mysql-client/releases/tag/v1.1.0
 [1.0.1]: https://github.com/gistrec/mcp-mysql-client/releases/tag/v1.0.1
 [1.0.0]: https://github.com/gistrec/mcp-mysql-client/releases/tag/v1.0.0

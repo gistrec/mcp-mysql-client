@@ -10,6 +10,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { instrumentToolCalls, Telemetry, telemetryEnabled, TOOL_OUTCOMES, toolOutcome } from "./telemetry.js";
+import { fail } from "./tools/util.js";
+import { CredentialsError, MysqlError, PermissionError, TimeoutError, ValidationError } from "./types.js";
 
 interface Sent {
   url: string;
@@ -227,4 +229,136 @@ test("with telemetry off the result is not inspected at all", async () => {
   const before = reads;
   await mcp.callTool({ name: "probe", arguments: {} });
   assert.ok(reads - before <= 1, "only the SDK itself may read the result");
+});
+
+// --- error_detail ------------------------------------------------------------
+
+/** Runs one tool that answers fail(err) and returns the tool_call body that went out. */
+async function failedCall(err: unknown): Promise<Record<string, unknown>> {
+  const sent: Sent[] = [];
+  const telemetry = new Telemetry("1.0.0", true, recordingFetch(sent));
+  const server = new McpServer({ name: "test-server", version: "0.0.0" });
+  instrumentToolCalls(server, telemetry);
+  server.registerTool("query", { description: "q", inputSchema: {} }, async () => fail(err));
+  const mcp = new Client({ name: "test-client", version: "9.9.9" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await mcp.connect(clientTransport);
+  const res = await mcp.callTool({ name: "query", arguments: {} });
+  assert.equal((res as { isError?: boolean }).isError, true);
+  const call = sent.find((s) => s.body.event === "tool_call");
+  assert.ok(call, "a tool_call must go out");
+  return call.body;
+}
+
+test("a MySQL error sends its codes, never the quoted values", async () => {
+  const body = await failedCall(
+    new MysqlError("Duplicate entry 'ivan@example.com' for key 'users.email'", {
+      code: "ER_DUP_ENTRY",
+      errno: 1062,
+      sqlState: "23000",
+    }),
+  );
+  assert.equal(body.error_detail, "mysql ER_DUP_ENTRY errno=1062 sqlState=23000");
+  assert.equal(body.reason, "error_invalid_request");
+  const wire = JSON.stringify(body);
+  for (const leak of ["ivan", "users", "Duplicate"]) assert.ok(!wire.includes(leak), `${leak} must not reach telemetry`);
+});
+
+test("a parse error never carries the SQL fragment", async () => {
+  const body = await failedCall(
+    new MysqlError(
+      "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version " +
+        "for the right syntax to use near 'FORM payroll WHERE salary > 100000' at line 1",
+      { code: "ER_PARSE_ERROR", errno: 1064, sqlState: "42000" },
+    ),
+  );
+  assert.equal(body.error_detail, "mysql ER_PARSE_ERROR errno=1064 sqlState=42000");
+  assert.equal(body.reason, "error_invalid_request");
+  const wire = JSON.stringify(body);
+  for (const leak of ["payroll", "salary", "FORM", "syntax"]) assert.ok(!wire.includes(leak), leak);
+});
+
+test("an unknown column is error_not_found by its errno", async () => {
+  const body = await failedCall(
+    new MysqlError("Unknown column 'pasport_no' in 'field list'", {
+      code: "ER_BAD_FIELD_ERROR",
+      errno: 1054,
+      sqlState: "42S22",
+    }),
+  );
+  assert.equal(body.reason, "error_not_found");
+  assert.equal(body.error_detail, "mysql ER_BAD_FIELD_ERROR errno=1054 sqlState=42S22");
+  assert.ok(!JSON.stringify(body).includes("pasport_no"));
+});
+
+test("a MySQL error's fields pass only their strict patterns", async () => {
+  const body = await failedCall(
+    new MysqlError("x", { code: "users.email secret", errno: 1.5, sqlState: "drop table" } as never),
+  );
+  assert.equal(body.error_detail, "mysql");
+  const wire = JSON.stringify(body);
+  for (const leak of ["users", "secret", "drop"]) assert.ok(!wire.includes(leak), leak);
+});
+
+test("a driver network code is error_network", async () => {
+  const body = await failedCall(new MysqlError("connect ECONNREFUSED 10.1.2.3:3306", { code: "ECONNREFUSED" }));
+  assert.equal(body.reason, "error_network");
+  assert.equal(body.error_detail, "mysql ECONNREFUSED");
+  assert.ok(!JSON.stringify(body).includes("10.1.2.3"));
+});
+
+test("a PermissionError sends its kind, not the statement", async () => {
+  const body = await failedCall(
+    new PermissionError("DELETE запрещён: сервер запущен без ALLOW_DELETE_OPERATION=true.", "delete"),
+  );
+  assert.equal(body.reason, "error_permission");
+  assert.equal(body.error_detail, "local: PermissionError kind=delete");
+  const junk = await failedCall(new PermissionError("x", "orders_2024"));
+  assert.equal(junk.error_detail, "local: PermissionError", "a kind outside the vocabulary is dropped");
+});
+
+test("a TimeoutError is error_timeout with the class name only", async () => {
+  const body = await failedCall(new TimeoutError(30_000));
+  assert.equal(body.reason, "error_timeout");
+  assert.equal(body.error_detail, "TimeoutError");
+});
+
+test("a ValidationError never carries the table name", async () => {
+  for (const table of ["salaries_secret", "odd»name"]) {
+    const body = await failedCall(
+      new ValidationError(
+        `В подключённой базе нет таблицы «${table}» (или у пользователя нет прав на неё). ` +
+          "Список доступных таблиц вернёт list_tables.",
+      ),
+    );
+    assert.equal(body.reason, "error_invalid_request");
+    assert.match(String(body.error_detail), /^local: /);
+    const wire = JSON.stringify(body);
+    for (const leak of table.split("»")) assert.ok(!wire.includes(leak), `${leak} must not reach telemetry`);
+  }
+});
+
+test("a CredentialsError is error_auth and never names the variables", async () => {
+  const body = await failedCall(
+    new CredentialsError("Подключение к MySQL не настроено: не заданы MYSQL_HOST, MYSQL_USER."),
+  );
+  assert.equal(body.reason, "error_auth");
+  assert.equal(body.error_detail, "CredentialsError");
+  assert.ok(!JSON.stringify(body).includes("MYSQL_"));
+});
+
+test("a bug in our code is error_internal", async () => {
+  const body = await failedCall(new TypeError("Cannot read properties of undefined (reading 'rows')"));
+  assert.equal(body.reason, "error_internal");
+  assert.match(String(body.error_detail), /^internal: TypeError/);
+});
+
+test("error_detail rides only with tool_call", () => {
+  const sent: Sent[] = [];
+  const t = new Telemetry("1.0.0", true, recordingFetch(sent));
+  t.send("startup_failed", { reason: "x", error_detail: "mysql ER_X" });
+  t.send("tool_call", { tool: "q", reason: "error_other", error_detail: "y".repeat(500) });
+  assert.equal(sent[0].body.error_detail, undefined);
+  assert.equal(String(sent[1].body.error_detail).length, 200);
 });
